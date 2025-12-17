@@ -62,9 +62,8 @@ prompt_messages = {}
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- PERSISTÊNCIA ASSÍNCRONA (OTIMIZAÇÃO) ---
+# --- PERSISTÊNCIA ASSÍNCRONA ---
 async def save_state_async():
-    """Salva estado em background para não travar o bot."""
     data = {
         'CLIENT_GROUPS': CLIENT_GROUPS, 
         'user_states': user_states, 
@@ -74,7 +73,6 @@ async def save_state_async():
         'ticket_first_session': ticket_first_session
     }
     try:
-        # Executa I/O em thread separada
         await asyncio.to_thread(write_pickle, data)
     except Exception as e: logger.error(f"Erro save async: {e}")
 
@@ -96,7 +94,7 @@ def load_state():
     except: pass
 
 # --- FUNÇÕES IA ---
-def generate_ai_analysis(messages, current_desc, is_first_session):
+def generate_ai_analysis(messages, current_desc, is_first_session, closing_reason="manual"):
     if not GEMINI_API_KEY or not messages: return None
     
     models_to_try = ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-flash-latest']
@@ -110,11 +108,19 @@ def generate_ai_analysis(messages, current_desc, is_first_session):
             "Tag: [NOVO_TITULO: Titulo].\n"
         )
 
+    # Lógica de fechamento mais rigorosa
+    instruction_closing = (
+        "- Se o cliente CONFIRMOU EXPLICITAMENTE que foi resolvido (ex: 'funcionou', 'pode fechar', 'obrigado, deu certo'), adicione [FECHAR_CHAMADO].\n"
+        "- Se o chat acabou por inatividade, falta de resposta ou sem confirmação clara, NÃO adicione a tag de fechar."
+    )
+    if closing_reason == "inactivity":
+        instruction_closing = "- O chat foi encerrado por INATIVIDADE. NÃO adicione a tag [FECHAR_CHAMADO] sob nenhuma hipótese. Apenas resuma o que foi dito até agora."
+
     prompt = (
         "Atue como Consultor Sênior ISP.\n"
         "Gere relatório técnico profissional.\n\n"
         "ESTILO:\n- Direto, listas (•), sem asteriscos (**), use CAIXA ALTA para títulos.\n\n"
-        "FECHAMENTO:\n- Se resolvido, adicione [FECHAR_CHAMADO].\n"
+        f"CRITÉRIO DE FECHAMENTO ({closing_reason}):\n{instruction_closing}\n\n"
         f"{instruction_title}\n"
         "ESTRUTURA:\n"
         "🚩 OCORRÊNCIA\n[Resumo]\n\n"
@@ -177,12 +183,7 @@ def refresh_clients_from_notion():
                 new_map[chat_id] = name
             except: pass
         CLIENT_GROUPS = new_map
-        # Salva de forma síncrona aqui pois é job de background
-        try: write_pickle({
-            'CLIENT_GROUPS': CLIENT_GROUPS, 'user_states': user_states, 
-            'last_activity': last_activity, 'group_status': group_status,
-            'active_ticket_session': active_ticket_session, 'ticket_first_session': ticket_first_session
-        })
+        try: asyncio.create_task(save_state_async())
         except: pass
         return f"OK: {len(new_map)} clientes."
     except Exception as e: return f"Erro: {str(e)}"
@@ -316,7 +317,8 @@ async def open_group_globally(chat_id, context):
         return True, ""
     except Exception as e: return False, str(e)
 
-async def lock_group_globally(chat_id, context):
+# ADICIONADO PARAMETRO 'reason' PARA CONTROLE DA IA
+async def lock_group_globally(chat_id, context, reason="manual"):
     try:
         await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=False))
         group_status[chat_id] = 'CLOSED'
@@ -329,7 +331,8 @@ async def lock_group_globally(chat_id, context):
         
         if logs and ticket_id:
             current_desc = get_ticket_desc(ticket_id)
-            analysis = generate_ai_analysis(logs, current_desc, is_first)
+            # PASSA O MOTIVO DO FECHAMENTO PARA A IA
+            analysis = generate_ai_analysis(logs, current_desc, is_first, reason)
             
             if analysis and "Erro IA" not in analysis:
                 notion_updates = {}
@@ -407,7 +410,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu_new_msg(cid, context, f"🤖 *Atendimento {name}*")
 
 async def manual_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await lock_group_globally(update.effective_chat.id, context)
+    # Fechamento Manual (Pode fechar se resolvido)
+    await lock_group_globally(update.effective_chat.id, context, reason="manual")
     await show_menu_new_msg(update.effective_chat.id, context, "🔒 *Menu*")
 
 async def show_menu_new_msg(chat_id, context, text):
@@ -421,7 +425,6 @@ async def show_menu_new_msg(chat_id, context, text):
 async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     
-    # 1. RESPOSTA IMEDIATA PARA NÃO TRAVAR O BOTÃO
     try: await q.answer()
     except: pass
     
@@ -453,7 +456,8 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == 'cancel':
         if k in user_states: del user_states[k]; await save_state_async()
-        await lock_group_globally(cid, context)
+        # Cancelamento manual (Também não deve fechar ticket)
+        await lock_group_globally(cid, context, reason="inactivity") 
         await menu_inline(q, "🚫 *Operação Cancelada.*")
 
     elif q.data in ['list_update', 'list_view']:
@@ -591,13 +595,21 @@ async def job_init(app):
     
     async def lock():
         for c in CLIENT_GROUPS:
-            try: await lock_group_globally(c, app); await show_menu_new_msg(c, app, "🔒 *Menu Automático*")
-            except: pass
+            if group_status.get(c) == 'OPEN':
+                try: 
+                    # Fechamento Agendado (Passa 'inactivity' ou 'manual' para evitar fechar ticket)
+                    await lock_group_globally(c, app, reason="inactivity")
+                    await show_menu_new_msg(c, app, "🔒 *Menu Automático*")
+                except: pass
+            
     async def inact():
         n = datetime.now(TIMEZONE)
         for c in CLIENT_GROUPS:
             if group_status.get(c) == 'OPEN' and last_activity.get(c) and (n - last_activity[c] > timedelta(minutes=MINUTOS_INATIVIDADE)):
-                try: await lock_group_globally(c, app); await show_menu_new_msg(c, app, "🔒 *Fechado por Inatividade*")
+                try: 
+                    # Fechamento por Inatividade (PROIBIDO fechar ticket)
+                    await lock_group_globally(c, app, reason="inactivity")
+                    await show_menu_new_msg(c, app, "🔒 *Fechado por Inatividade*")
                 except Exception as e: logger.error(f"Erro inact {c}: {e}")
     s.add_job(lock, 'cron', day_of_week='mon-fri', hour=HORA_INICIO_EXPEDIENTE)
     s.add_job(lock, 'cron', day_of_week='mon-fri', hour=HORA_FIM_EXPEDIENTE)
@@ -612,5 +624,5 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('debug', debug_cmd))
     application.add_handler(CallbackQueryHandler(btn_handler))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & ~filters.COMMAND, msg_handler))
-    print("Bot rodando com persistência e IA v6.6...")
+    print("Bot rodando com persistência e IA v6.8...")
     application.run_polling()
